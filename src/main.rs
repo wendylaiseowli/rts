@@ -14,13 +14,6 @@ struct WikiChange<'a> {
     server_name: Option<&'a str>,
 }
 
-// Wrap queued item with arrival timestamp
-struct QueuedChange {
-    arrival: SystemTime, // when the item was received
-    bytes: Bytes,
-}
-
-
 // pub async fn run_async_pipeline() {
 //     let url = "https://stream.wikimedia.org/v2/stream/recentchange";
 
@@ -93,40 +86,25 @@ use bytes::Bytes;
 pub fn run_threaded_pipeline() {
     let url = "https://stream.wikimedia.org/v2/stream/recentchange";
 
-    // -------------------------
-    // Two separate queues for priority
-    // -------------------------
-    let human_queue: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::with_capacity(100)));
-    let bot_queue: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::with_capacity(100)));
-
-    let human_worker = human_queue.clone();
-    let bot_worker = bot_queue.clone();
+    let queue: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::with_capacity(100)));
+    let queue_worker = queue.clone();
 
     // -------------------------
-    // Worker thread (priority)
+    // Worker thread
     // -------------------------
     let worker_handle = thread::spawn(move || loop {
         let maybe_json = {
-            // Always try human queue first
-            let mut guard = human_worker.lock().unwrap();
-            if let Some(json) = guard.pop_front() {
-                Some(json)
-            } else {
-                // If human queue empty, try bot queue
-                let mut bot_guard = bot_worker.lock().unwrap();
-                bot_guard.pop_front()
-            }
+            let mut guard = queue_worker.lock().unwrap();
+            guard.pop_front()
         };
 
         if let Some(json_bytes) = maybe_json {
             let start = SystemTime::now();
 
+            // Parse directly from Bytes (zero-copy for deserializer)
             if let Ok(change) = serde_json::from_slice::<WikiChange>(&json_bytes) {
-                if change.bot.unwrap_or(false) {
-                    println!("Bot Edit: {:?}", change);
-                } else {
-                    println!("Human Edit: {:?}", change);
-                }
+                if let Some(true) = change.bot { continue; }
+                println!("{:?}", change);
             }
 
             if let Ok(elapsed) = start.elapsed() {
@@ -140,8 +118,7 @@ pub fn run_threaded_pipeline() {
     // -------------------------
     // Producer thread
     // -------------------------
-    let human_producer = human_queue.clone();
-    let bot_producer = bot_queue.clone();
+    let queue_producer = queue.clone();
     let producer_handle = thread::spawn(move || {
         let client = Client::new();
         let response = match client.get(url)
@@ -156,24 +133,25 @@ pub fn run_threaded_pipeline() {
         };
 
         let reader = BufReader::new(response);
-        for line in reader.split(b'\n') {
+        for line in reader.split(b'\n') {  // stable: split by newline
             match line {
                 Ok(mut line_bytes) => {
                     if line_bytes.starts_with(b"data: ") {
-                        let json_bytes = Bytes::copy_from_slice(&line_bytes[6..]);
+                        // Remove "data: " prefix by slicing
+                        let mut line_bytes = Bytes::from(line_bytes);
+                        let json_bytes = line_bytes.split_off(6); 
 
-                        // Peek bot flag from raw JSON bytes
-                        let is_bot = json_bytes.windows(7).any(|w| w == b"\"bot\":true");
+                        let mut guard = queue_producer.lock().unwrap();
 
-                        if is_bot {
-                            let mut guard = bot_producer.lock().unwrap();
-                            if guard.len() == 100 { guard.pop_front(); }
-                            guard.push_back(json_bytes);
-                        } else {
-                            let mut guard = human_producer.lock().unwrap();
-                            if guard.len() == 100 { guard.pop_front(); }
-                            guard.push_back(json_bytes);
+                        if guard.len() == 100 {
+                            guard.pop_front();
+                            println!(
+                                "[{:?}] ⚠️ Overflow Event: Dropped oldest packet",
+                                SystemTime::now()
+                            );
                         }
+
+                        guard.push_back(json_bytes);
                     }
                 }
                 Err(e) => eprintln!("Failed to read line: {:?}", e),
