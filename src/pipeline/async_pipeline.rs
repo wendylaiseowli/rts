@@ -1,44 +1,36 @@
-// Async/Await version
 use reqwest::Client;
 use futures_util::StreamExt;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::{SystemTime, Duration};
-use bytes::Bytes;
+use std::time::{SystemTime};
 use crate::types::WikiChange;
+use bytes::Bytes;
 
 pub async fn run_async_pipeline() {
     let url = "https://stream.wikimedia.org/v2/stream/recentchange";
 
-    let queue: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::with_capacity(100)));
-    let queue_worker = queue.clone();
+    // Bounded channel for worker, capacity 100
+    let (tx, mut rx) = mpsc::channel::<Bytes>(100);
+
+    // Side queue to manage drop-oldest
+    let queue: VecDeque<Bytes> = VecDeque::with_capacity(100);
+    let queue = tokio::sync::Mutex::new(queue);
+    let tx_clone = tx.clone();
 
     // Worker task
     tokio::spawn(async move {
-        loop {
-            let mut guard = queue_worker.lock().await;
-            if let Some(json_bytes) = guard.pop_front() {
-                drop(guard);
-
-                let start = SystemTime::now();
-                if let Ok(change) = serde_json::from_slice::<WikiChange>(&json_bytes) {  // from_slice borrows from Bytes
-                    if let Some(true) = change.bot {
-                        continue;
-                    }
-                    println!("{:?}", change);
-                }
-
-                if let Ok(elapsed) = start.elapsed() {
-                    println!("Processing time: {:?}", elapsed);
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+        while let Some(json_bytes) = rx.recv().await {
+            let start = SystemTime::now();
+            if let Ok(change) = serde_json::from_slice::<WikiChange>(&json_bytes) {
+                println!("{:?}", change);
+            }
+            if let Ok(elapsed) = start.elapsed() {
+                println!("Processing time: {:?}", elapsed);
             }
         }
     });
 
-    // Producer (Stream ingestion)
+    // Producer (stream ingestion)
     let client = Client::new();
     let response = client
         .get(url)
@@ -50,11 +42,13 @@ pub async fn run_async_pipeline() {
     let mut stream = response.bytes_stream();
 
     while let Some(item) = stream.next().await {
-        let chunk = item.unwrap(); // chunk: Bytes
-        if chunk.starts_with(b"data: ") {           // compare with byte slice
-            let json_bytes = chunk.slice(6..);      // zero-copy slice
+        let chunk = item.unwrap();
+        if chunk.starts_with(b"data: ") {
+            let json_bytes = chunk.slice(6..);
+
             let mut guard = queue.lock().await;
 
+            // Drop oldest if full
             if guard.len() == 100 {
                 guard.pop_front();
                 println!(
@@ -62,7 +56,14 @@ pub async fn run_async_pipeline() {
                     SystemTime::now()
                 );
             }
-            guard.push_back(json_bytes);  // store Bytes directly
+
+            guard.push_back(json_bytes.clone());
+
+            // Try sending to the channel without blocking
+            if let Err(TrySendError::Closed(_)) = tx_clone.try_send(json_bytes) {
+                // Receiver closed; exit producer loop
+                break;
+            }
         }
     }
 }
