@@ -1,20 +1,26 @@
-use reqwest::Client;
-use futures_util::StreamExt;
-use tokio::sync::{mpsc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use crate::types::WikiChange;
 use bytes::Bytes;
+use futures_util::StreamExt;
+use reqwest::Client;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, mpsc};
 
 const CHANNEL_CAPACITY: usize = 2;
 const DEADLINE: Duration = Duration::from_millis(2);
+
+#[derive(Clone)]
+struct QueuedChange {
+    payload: Bytes,
+    enqueued_at: SystemTime,
+}
 
 pub async fn run_async_pipeline() {
     let url = "https://stream.wikimedia.org/v2/stream/recentchange";
 
     // Separate channels for human and bot edits
-    let (tx_human, rx_human) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
-    let (tx_bot, rx_bot) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+    let (tx_human, rx_human) = mpsc::channel::<QueuedChange>(CHANNEL_CAPACITY);
+    let (tx_bot, rx_bot) = mpsc::channel::<QueuedChange>(CHANNEL_CAPACITY);
 
     // Receivers are shared so producer can drop oldest item when a lane is full.
     let rx_human = Arc::new(Mutex::new(rx_human));
@@ -28,10 +34,10 @@ pub async fn run_async_pipeline() {
     // Worker task: always prioritize human edits
     tokio::spawn(async move {
         loop {
-            if let Some(json_bytes) = recv_prioritized(&rx_human_worker, &rx_bot_worker).await {
+            if let Some(message) = recv_prioritized(&rx_human_worker, &rx_bot_worker).await {
                 // Deadline starts when packet leaves the ingestion channel.
                 let dequeue_time = SystemTime::now();
-                process_change(json_bytes, dequeue_time).await;
+                process_change(message, dequeue_time).await;
             } else {
                 break;
             }
@@ -56,14 +62,23 @@ pub async fn run_async_pipeline() {
 
             // Parse the change zero-copy
             if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&json_bytes) {
-                let lane = if change.bot.unwrap_or(false) { "BOT" } else { "HUMAN" };
+                let lane = if change.bot.unwrap_or(false) {
+                    "BOT"
+                } else {
+                    "HUMAN"
+                };
                 let summary = change_summary(&change);
                 println!("INCOMING {} {}", lane, summary);
 
+                let packet = QueuedChange {
+                    payload: json_bytes.clone(),
+                    enqueued_at: SystemTime::now(),
+                };
+
                 let sent = if change.bot.unwrap_or(false) {
-                    send_with_drop_oldest(&tx_bot_clone, &rx_bot, json_bytes, lane, &summary).await
+                    send_with_drop_oldest(&tx_bot_clone, &rx_bot, packet, lane, &summary).await
                 } else {
-                    send_with_drop_oldest(&tx_human_clone, &rx_human, json_bytes, lane, &summary).await
+                    send_with_drop_oldest(&tx_human_clone, &rx_human, packet, lane, &summary).await
                 };
 
                 if !sent {
@@ -75,9 +90,9 @@ pub async fn run_async_pipeline() {
 }
 
 async fn recv_prioritized(
-    human_rx: &Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    bot_rx: &Arc<Mutex<mpsc::Receiver<Bytes>>>,
-) -> Option<Bytes> {
+    human_rx: &Arc<Mutex<mpsc::Receiver<QueuedChange>>>,
+    bot_rx: &Arc<Mutex<mpsc::Receiver<QueuedChange>>>,
+) -> Option<QueuedChange> {
     loop {
         let human_state = {
             let mut guard = human_rx.lock().await;
@@ -116,9 +131,9 @@ async fn recv_prioritized(
 }
 
 async fn send_with_drop_oldest(
-    tx: &mpsc::Sender<Bytes>,
-    rx: &Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    payload: Bytes,
+    tx: &mpsc::Sender<QueuedChange>,
+    rx: &Arc<Mutex<mpsc::Receiver<QueuedChange>>>,
+    payload: QueuedChange,
     lane: &str,
     summary: &str,
 ) -> bool {
@@ -139,8 +154,10 @@ async fn send_with_drop_oldest(
                 };
 
                 if let Some(oldest) = dropped {
-                    let oldest_summary = summarize_bytes(&oldest);
-                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+                    let oldest_summary = summarize_bytes(&oldest.payload);
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO);
                     println!(
                         "[{}.{:09}] ⚠️ Overflow Event: DROP {} dropped=[{}] incoming=[{}]",
                         ts.as_secs(),
@@ -159,22 +176,24 @@ async fn send_with_drop_oldest(
 }
 
 // Process a single WikiChange
-async fn process_change(json_bytes: Bytes, dequeue_time: SystemTime) {
+async fn process_change(packet: QueuedChange, dequeue_time: SystemTime) {
     let start = dequeue_time;
+    let queue_drift = match dequeue_time.duration_since(packet.enqueued_at) {
+        Ok(delta) => delta,
+        Err(_) => Duration::ZERO,
+    };
 
-    if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&json_bytes) {
+    if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&packet.payload) {
         // Keep packet logs compact to reduce log-induced contention.
-        let label = if change.bot.unwrap_or(false) { "BOT" } else { "HUMAN" };
+        let label = if change.bot.unwrap_or(false) {
+            "BOT"
+        } else {
+            "HUMAN"
+        };
         println!("DEQUEUE {} {}", label, change_summary(&change));
 
-        // Calculate scheduling drift if timestamp exists
-        if let Some(timestamp) = change.timestamp_sec {
-            let expected = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
-            if let Ok(drift) = start.duration_since(expected) {
-                // Labeling makes the demonstration clear in logs
-                println!("{} Scheduling Drift: {:?}", label, drift);
-            }
-        }
+        // Scheduling drift is the time spent waiting in the queue.
+        println!("{} Scheduling Drift: {:?}", label, queue_drift);
     }
 
     if let Ok(elapsed) = start.elapsed() {

@@ -7,8 +7,6 @@ pub struct WikiChange<'a> {
     pub user: Option<&'a str>,
     pub bot: Option<bool>,
     pub server_name: Option<&'a str>,
-    #[serde(rename = "timestamp")]
-    pub timestamp_sec: Option<i64>
 }
 
 #[derive(Debug, Deserialize)]
