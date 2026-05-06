@@ -4,6 +4,8 @@ use serde::Deserialize;
 pub struct WikiChange<'a> {
     #[serde(borrow)]
     pub meta: Option<ChangeMeta<'a>>,
+    pub namespace: Option<i64>,
+    pub title: Option<&'a str>,
     pub user: Option<&'a str>,
     pub bot: Option<bool>,
     pub server_name: Option<&'a str>,

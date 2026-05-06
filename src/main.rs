@@ -1,3 +1,5 @@
+mod logging;
+mod metrics;
 mod pipeline;
 mod types;
 use pipeline::async_pipeline::run_async_pipeline;
