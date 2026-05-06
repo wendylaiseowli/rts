@@ -4,9 +4,7 @@ use crate::types::WikiChange;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc};
 
@@ -17,8 +15,6 @@ const REPORT_EVERY: u64 = 100;
 #[derive(Clone)]
 struct QueuedChange {
     payload: Bytes,
-    doc_key: String,
-    sequence: u64,
 }
 
 struct ProcessSample {
@@ -36,38 +32,41 @@ pub async fn run_async_pipeline() {
     // Receivers are shared so the producer can drop the oldest item when a lane is full.
     let rx_human = Arc::new(Mutex::new(rx_human));
     let rx_bot = Arc::new(Mutex::new(rx_bot));
-    let latest_versions = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
     let leaderboard = Arc::new(Mutex::new(DomainLeaderboard::default()));
-    let next_sequence = Arc::new(AtomicU64::new(1));
 
     let tx_human_clone = tx_human.clone();
     let tx_bot_clone = tx_bot.clone();
     let rx_human_worker = Arc::clone(&rx_human);
     let rx_bot_worker = Arc::clone(&rx_bot);
-    let latest_versions_for_drop = Arc::clone(&latest_versions);
     let leaderboard_for_drop = Arc::clone(&leaderboard);
-    let next_sequence_for_drop = Arc::clone(&next_sequence);
 
     // Worker task: always prioritize human edits.
     tokio::spawn(async move {
         let mut stats = DriftStats::default();
-        let latest_versions = Arc::clone(&latest_versions);
         let leaderboard = Arc::clone(&leaderboard);
 
         loop {
-            if let Some(message) = recv_prioritized(&rx_human_worker, &rx_bot_worker).await {
-                // Deadline starts when the packet leaves the ingestion channel.
-                let deadline_start = Instant::now();
-                let sample = process_change(message, deadline_start, &latest_versions).await;
-                stats.record(sample.scheduling_drift_ns, sample.processing_time, DEADLINE);
-
-                if stats.processed() % REPORT_EVERY == 0 {
-                    stats.report();
-                    let lb = leaderboard.lock().await;
-                    let _ = lb.write_html(None);
-                }
-            } else {
+            let Some(message) = recv_prioritized(&rx_human_worker, &rx_bot_worker).await else {
                 break;
+            };
+
+            let mut message = message;
+            if is_bot_packet(&message) {
+                if let Some(human_packet) = try_recv_human_now(&rx_human_worker).await {
+                    log_line("🚫 BOT OVERRIDDEN by a newly arrived HUMAN packet.");
+                    message = human_packet;
+                }
+            }
+
+            // Deadline starts when the packet leaves the ingestion channel.
+            let deadline_start = Instant::now();
+            let sample = process_change(message, deadline_start).await;
+            stats.record(sample.scheduling_drift_ns, sample.processing_time, DEADLINE);
+
+            if stats.processed() % REPORT_EVERY == 0 {
+                stats.report();
+                let lb = leaderboard.lock().await;
+                let _ = lb.write_html(None);
             }
         }
 
@@ -75,7 +74,6 @@ pub async fn run_async_pipeline() {
         let lb = leaderboard.lock().await;
         let _ = lb.write_html(None);
     });
-
     // Producer: ingest stream.
     let client = Client::new();
     let response = client
@@ -106,17 +104,9 @@ pub async fn run_async_pipeline() {
                     let mut lb = leaderboard_for_drop.lock().await;
                     lb.record(&domain);
                 }
-                let doc_key = document_key(&change);
-                let sequence = next_sequence_for_drop.fetch_add(1, Ordering::Relaxed);
-                {
-                    let mut latest = latest_versions_for_drop.lock().await;
-                    latest.insert(doc_key.clone(), sequence);
-                }
 
                 let packet = QueuedChange {
                     payload: json_bytes.clone(),
-                    doc_key,
-                    sequence,
                 };
 
                 let sent = if change.bot.unwrap_or(false) {
@@ -218,63 +208,10 @@ async fn send_with_drop_oldest(
 async fn process_change(
     packet: QueuedChange,
     deadline_start: Instant,
-    latest_versions: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> ProcessSample {
-    let mut overridden = false;
-
-    if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&packet.payload) {
-        if change.bot.unwrap_or(false) {
-            let is_stale = {
-                let latest = latest_versions.lock().await;
-                latest
-                    .get(&packet.doc_key)
-                    .is_some_and(|latest_seq| *latest_seq > packet.sequence)
-            };
-
-            if is_stale {
-                overridden = true;
-                log_line(format!(
-                    "🚫 BOT OVERRIDDEN: doc_key={} seq={} newer_human_seq_exists",
-                    packet.doc_key, packet.sequence
-                ));
-            }
-        }
-    }
-
     let actual_processing_time = deadline_start.elapsed();
     let scheduling_drift_ns =
         actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
-
-    if overridden {
-        if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&packet.payload) {
-            let label = if change.bot.unwrap_or(false) {
-                "BOT"
-            } else {
-                "HUMAN"
-            };
-            log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
-            log_line(format!(
-                "⏱ {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
-                label, actual_processing_time, DEADLINE, scheduling_drift_ns
-            ));
-        }
-        log_line("⏭ Final processing skipped because a newer human edit won.");
-        if actual_processing_time > DEADLINE {
-            log_line(format!(
-                "⛔ DEADLINE MISSED: {:?} (limit: {:?}) [overridden]",
-                actual_processing_time, DEADLINE
-            ));
-        } else {
-            log_line(format!(
-                "✅ Deadline met: {:?} [overridden]",
-                actual_processing_time
-            ));
-        }
-        return ProcessSample {
-            scheduling_drift_ns,
-            processing_time: actual_processing_time,
-        };
-    }
 
     if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&packet.payload) {
         // Keep packet logs compact to reduce log-induced contention.
@@ -283,20 +220,20 @@ async fn process_change(
         } else {
             "HUMAN"
         };
-        log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
+        log_line(format!("?? DEQUEUE {} {}", label, change_summary(&change)));
         log_line(format!(
-            "⏱ {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
+            "? {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
             label, actual_processing_time, DEADLINE, scheduling_drift_ns
         ));
     }
 
     if actual_processing_time > DEADLINE {
         log_line(format!(
-            "⛔ DEADLINE MISSED: {:?} (limit: {:?})",
+            "? DEADLINE MISSED: {:?} (limit: {:?})",
             actual_processing_time, DEADLINE
         ));
     } else {
-        log_line(format!("✅ Deadline met: {:?}", actual_processing_time));
+        log_line(format!("? Deadline met: {:?}", actual_processing_time));
     }
 
     ProcessSample {
@@ -305,14 +242,11 @@ async fn process_change(
     }
 }
 
-fn document_key(change: &WikiChange<'_>) -> String {
-    let namespace = change
-        .namespace
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let title = change.title.unwrap_or("unknown");
-
-    format!("{}:{}", namespace, title)
+async fn try_recv_human_now(
+    human_rx: &Arc<Mutex<mpsc::Receiver<QueuedChange>>>,
+) -> Option<QueuedChange> {
+    let mut guard = human_rx.lock().await;
+    guard.try_recv().ok()
 }
 
 fn domain_key(change: &WikiChange<'_>) -> String {
@@ -335,3 +269,13 @@ fn summarize_bytes(bytes: &Bytes) -> String {
         format!("raw {} bytes", bytes.len())
     }
 }
+
+fn is_bot_packet(packet: &QueuedChange) -> bool {
+    serde_json::from_slice::<WikiChange<'_>>(&packet.payload)
+        .ok()
+        .and_then(|change| change.bot)
+        .unwrap_or(false)
+}
+
+
+

@@ -3,9 +3,7 @@ use crate::metrics::{DomainLeaderboard, DriftStats};
 use crate::types::WikiChange;
 use bytes::Bytes;
 use reqwest::blocking::Client;
-use std::collections::HashMap;
 use std::io::Read;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,8 +16,6 @@ const REPORT_EVERY: u64 = 100;
 #[derive(Clone)]
 struct QueuedChange {
     payload: Bytes,
-    doc_key: String,
-    sequence: u64,
 }
 
 struct ProcessSample {
@@ -36,44 +32,45 @@ pub fn run_threaded_pipeline() {
 
     let rx_human = Arc::new(Mutex::new(rx_human));
     let rx_bot = Arc::new(Mutex::new(rx_bot));
-    let latest_versions = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
     let leaderboard = Arc::new(Mutex::new(DomainLeaderboard::default()));
-    let next_sequence = Arc::new(AtomicU64::new(1));
 
     let tx_human_clone = tx_human.clone();
     let tx_bot_clone = tx_bot.clone();
     let rx_human_for_drop = Arc::clone(&rx_human);
     let rx_bot_for_drop = Arc::clone(&rx_bot);
-    let latest_versions_for_drop = Arc::clone(&latest_versions);
     let leaderboard_for_drop = Arc::clone(&leaderboard);
-    let next_sequence_for_drop = Arc::clone(&next_sequence);
 
     // Worker thread: always prioritize human edits.
     let worker_handle = {
         let rx_human = rx_human.clone();
         let rx_bot = rx_bot.clone();
-        let latest_versions = Arc::clone(&latest_versions);
         let leaderboard = Arc::clone(&leaderboard);
         thread::spawn(move || {
             let mut stats = DriftStats::default();
 
             loop {
-                match recv_prioritized(&rx_human, &rx_bot) {
-                    Some(message) => {
-                        // Deadline starts when the packet leaves the ingestion channel.
-                        let deadline_start = Instant::now();
-                        let sample =
-                            process_change_thread(message, deadline_start, &latest_versions);
-                        stats.record(sample.scheduling_drift_ns, sample.processing_time, DEADLINE);
+                let Some(message) = recv_prioritized(&rx_human, &rx_bot) else {
+                    break;
+                };
 
-                        if stats.processed() % REPORT_EVERY == 0 {
-                            stats.report();
-                            if let Ok(lb) = leaderboard.lock() {
-                                let _ = lb.write_html(None);
-                            }
-                        }
+                let mut message = message;
+                if is_bot_packet(&message) {
+                    if let Some(human_packet) = try_recv_human_now(&rx_human) {
+                        log_line("🚫 BOT OVERRIDDEN by a newly arrived HUMAN packet.");
+                        message = human_packet;
                     }
-                    None => break,
+                }
+
+                // Deadline starts when the packet leaves the ingestion channel.
+                let deadline_start = Instant::now();
+                let sample = process_change_thread(message, deadline_start);
+                stats.record(sample.scheduling_drift_ns, sample.processing_time, DEADLINE);
+
+                if stats.processed() % REPORT_EVERY == 0 {
+                    stats.report();
+                    if let Ok(lb) = leaderboard.lock() {
+                        let _ = lb.write_html(None);
+                    }
                 }
             }
 
@@ -83,7 +80,6 @@ pub fn run_threaded_pipeline() {
             }
         })
     };
-
     // Producer thread.
     let producer_handle = thread::spawn(move || {
         let client = Client::new();
@@ -125,19 +121,9 @@ pub fn run_threaded_pipeline() {
                                 if let Ok(mut lb) = leaderboard_for_drop.lock() {
                                     lb.record(&domain);
                                 }
-                                let doc_key = document_key(&change);
-                                let sequence =
-                                    next_sequence_for_drop.fetch_add(1, Ordering::Relaxed);
-
-                                {
-                                    let mut latest = latest_versions_for_drop.lock().unwrap();
-                                    latest.insert(doc_key.clone(), sequence);
-                                }
 
                                 let packet = QueuedChange {
                                     payload: json_bytes.clone(),
-                                    doc_key,
-                                    sequence,
                                 };
 
                                 let sent = if change.bot.unwrap_or(false) {
@@ -263,63 +249,10 @@ fn send_with_drop_oldest(
 fn process_change_thread(
     message: QueuedChange,
     deadline_start: Instant,
-    latest_versions: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> ProcessSample {
-    let mut overridden = false;
-
-    if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&message.payload) {
-        if change.bot.unwrap_or(false) {
-            let is_stale = {
-                let latest = latest_versions.lock().unwrap();
-                latest
-                    .get(&message.doc_key)
-                    .is_some_and(|latest_seq| *latest_seq > message.sequence)
-            };
-
-            if is_stale {
-                overridden = true;
-                log_line(format!(
-                    "🚫 BOT OVERRIDDEN: doc_key={} seq={} newer_human_seq_exists",
-                    message.doc_key, message.sequence
-                ));
-            }
-        }
-    }
-
     let actual_processing_time = deadline_start.elapsed();
     let scheduling_drift_ns =
         actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
-
-    if overridden {
-        if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&message.payload) {
-            let label = if change.bot.unwrap_or(false) {
-                "BOT"
-            } else {
-                "HUMAN"
-            };
-            log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
-            log_line(format!(
-                "⏱ {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
-                label, actual_processing_time, DEADLINE, scheduling_drift_ns
-            ));
-        }
-        log_line("⏭ Final processing skipped because a newer human edit won.");
-        if actual_processing_time > DEADLINE {
-            log_line(format!(
-                "⛔ DEADLINE MISSED: {:?} (limit: {:?}) [overridden]",
-                actual_processing_time, DEADLINE
-            ));
-        } else {
-            log_line(format!(
-                "✅ Deadline met: {:?} [overridden]",
-                actual_processing_time
-            ));
-        }
-        return ProcessSample {
-            scheduling_drift_ns,
-            processing_time: actual_processing_time,
-        };
-    }
 
     if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&message.payload) {
         let label = if change.bot.unwrap_or(false) {
@@ -349,14 +282,14 @@ fn process_change_thread(
     }
 }
 
-fn document_key(change: &WikiChange<'_>) -> String {
-    let namespace = change
-        .namespace
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let title = change.title.unwrap_or("unknown");
-
-    format!("{}:{}", namespace, title)
+fn try_recv_human_now(
+    human_rx: &Arc<Mutex<Receiver<QueuedChange>>>,
+) -> Option<QueuedChange> {
+    if let Ok(guard) = human_rx.lock() {
+        guard.try_recv().ok()
+    } else {
+        None
+    }
 }
 
 fn domain_key(change: &WikiChange<'_>) -> String {
@@ -386,6 +319,13 @@ fn summarize_bytes(bytes: &Bytes) -> String {
     }
 }
 
+fn is_bot_packet(packet: &QueuedChange) -> bool {
+    serde_json::from_slice::<WikiChange<'_>>(&packet.payload)
+        .ok()
+        .and_then(|change| change.bot)
+        .unwrap_or(false)
+}
+
 fn log_overflow_event(lane: &str, dropped_summary: &str, incoming_summary: &str) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -399,3 +339,4 @@ fn log_overflow_event(lane: &str, dropped_summary: &str, incoming_summary: &str)
         incoming_summary
     ));
 }
+
