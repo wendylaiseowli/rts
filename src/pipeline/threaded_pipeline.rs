@@ -1,5 +1,5 @@
 use crate::logging::{log_error, log_line};
-use crate::metrics::DriftStats;
+use crate::metrics::{DomainLeaderboard, DriftStats};
 use crate::types::WikiChange;
 use bytes::Bytes;
 use reqwest::blocking::Client;
@@ -18,13 +18,12 @@ const REPORT_EVERY: u64 = 100;
 #[derive(Clone)]
 struct QueuedChange {
     payload: Bytes,
-    enqueued_at: Instant,
     doc_key: String,
     sequence: u64,
 }
 
 struct ProcessSample {
-    scheduling_drift: Duration,
+    scheduling_drift_ns: i128,
     processing_time: Duration,
 }
 
@@ -38,6 +37,7 @@ pub fn run_threaded_pipeline() {
     let rx_human = Arc::new(Mutex::new(rx_human));
     let rx_bot = Arc::new(Mutex::new(rx_bot));
     let latest_versions = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+    let leaderboard = Arc::new(Mutex::new(DomainLeaderboard::default()));
     let next_sequence = Arc::new(AtomicU64::new(1));
 
     let tx_human_clone = tx_human.clone();
@@ -45,6 +45,7 @@ pub fn run_threaded_pipeline() {
     let rx_human_for_drop = Arc::clone(&rx_human);
     let rx_bot_for_drop = Arc::clone(&rx_bot);
     let latest_versions_for_drop = Arc::clone(&latest_versions);
+    let leaderboard_for_drop = Arc::clone(&leaderboard);
     let next_sequence_for_drop = Arc::clone(&next_sequence);
 
     // Worker thread: always prioritize human edits.
@@ -52,6 +53,7 @@ pub fn run_threaded_pipeline() {
         let rx_human = rx_human.clone();
         let rx_bot = rx_bot.clone();
         let latest_versions = Arc::clone(&latest_versions);
+        let leaderboard = Arc::clone(&leaderboard);
         thread::spawn(move || {
             let mut stats = DriftStats::default();
 
@@ -62,10 +64,13 @@ pub fn run_threaded_pipeline() {
                         let deadline_start = Instant::now();
                         let sample =
                             process_change_thread(message, deadline_start, &latest_versions);
-                        stats.record(sample.scheduling_drift, sample.processing_time, DEADLINE);
+                        stats.record(sample.scheduling_drift_ns, sample.processing_time, DEADLINE);
 
                         if stats.processed() % REPORT_EVERY == 0 {
                             stats.report();
+                            if let Ok(lb) = leaderboard.lock() {
+                                let _ = lb.write_html(None);
+                            }
                         }
                     }
                     None => break,
@@ -73,6 +78,9 @@ pub fn run_threaded_pipeline() {
             }
 
             stats.report();
+            if let Ok(lb) = leaderboard.lock() {
+                let _ = lb.write_html(None);
+            }
         })
     };
 
@@ -113,6 +121,10 @@ pub fn run_threaded_pipeline() {
                                 };
                                 let summary = change_summary(&change);
                                 log_line(format!("📥 INCOMING {} {}", lane, summary));
+                                let domain = domain_key(&change);
+                                if let Ok(mut lb) = leaderboard_for_drop.lock() {
+                                    lb.record(&domain);
+                                }
                                 let doc_key = document_key(&change);
                                 let sequence =
                                     next_sequence_for_drop.fetch_add(1, Ordering::Relaxed);
@@ -124,7 +136,6 @@ pub fn run_threaded_pipeline() {
 
                                 let packet = QueuedChange {
                                     payload: json_bytes.clone(),
-                                    enqueued_at: Instant::now(),
                                     doc_key,
                                     sequence,
                                 };
@@ -254,21 +265,9 @@ fn process_change_thread(
     deadline_start: Instant,
     latest_versions: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> ProcessSample {
-    let scheduling_drift = deadline_start.duration_since(message.enqueued_at);
     let mut overridden = false;
 
     if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&message.payload) {
-        let label = if change.bot.unwrap_or(false) {
-            "BOT"
-        } else {
-            "HUMAN"
-        };
-        log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
-        log_line(format!(
-            "⏱ {} Scheduling Drift: {:?}",
-            label, scheduling_drift
-        ));
-
         if change.bot.unwrap_or(false) {
             let is_stale = {
                 let latest = latest_versions.lock().unwrap();
@@ -287,38 +286,66 @@ fn process_change_thread(
         }
     }
 
-    let processing_time = deadline_start.elapsed();
+    let actual_processing_time = deadline_start.elapsed();
+    let scheduling_drift_ns =
+        actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
+
     if overridden {
+        if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&message.payload) {
+            let label = if change.bot.unwrap_or(false) {
+                "BOT"
+            } else {
+                "HUMAN"
+            };
+            log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
+            log_line(format!(
+                "⏱ {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
+                label, actual_processing_time, DEADLINE, scheduling_drift_ns
+            ));
+        }
         log_line("⏭ Final processing skipped because a newer human edit won.");
-        if processing_time > DEADLINE {
+        if actual_processing_time > DEADLINE {
             log_line(format!(
                 "⛔ DEADLINE MISSED: {:?} (limit: {:?}) [overridden]",
-                processing_time, DEADLINE
+                actual_processing_time, DEADLINE
             ));
         } else {
             log_line(format!(
                 "✅ Deadline met: {:?} [overridden]",
-                processing_time
+                actual_processing_time
             ));
         }
         return ProcessSample {
-            scheduling_drift,
-            processing_time,
+            scheduling_drift_ns,
+            processing_time: actual_processing_time,
         };
     }
 
-    if processing_time > DEADLINE {
+    if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&message.payload) {
+        let label = if change.bot.unwrap_or(false) {
+            "BOT"
+        } else {
+            "HUMAN"
+        };
+        log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
+        log_line(format!(
+            "⏱ {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
+            label, actual_processing_time, DEADLINE, scheduling_drift_ns
+        ));
+    }
+
+    if actual_processing_time > DEADLINE {
         log_line(format!(
             "⛔ DEADLINE MISSED: {:?} (limit: {:?})",
-            processing_time, DEADLINE
+            actual_processing_time, DEADLINE
         ));
     } else {
-        log_line(format!("✅ Deadline met: {:?}", processing_time));
+        log_line(format!("✅ Deadline met: {:?}", actual_processing_time));
     }
 
     ProcessSample {
-        scheduling_drift,
-        processing_time,
+        scheduling_drift_ns,
+        processing_time: actual_processing_time,
     }
 }
 
@@ -330,6 +357,10 @@ fn document_key(change: &WikiChange<'_>) -> String {
     let title = change.title.unwrap_or("unknown");
 
     format!("{}:{}", namespace, title)
+}
+
+fn domain_key(change: &WikiChange<'_>) -> String {
+    change.server_name.unwrap_or("unknown").to_string()
 }
 
 fn change_summary(change: &WikiChange<'_>) -> String {

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="2" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wikipedia Domain Leaderboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #111827;
+      --line: #243041;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --accent: #22c55e;
+    }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: radial-gradient(circle at top, #172033 0, var(--bg) 50%);
+      color: var(--text);
+      padding: 32px;
+    }
+    .card {
+      max-width: 800px;
+      margin: 0 auto;
+      background: rgba(17, 24, 39, 0.92);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+    }
+    h1 {
+      margin: 0 0 8px 0;
+      font-size: 28px;
+    }
+    p {
+      margin: 0 0 20px 0;
+      color: var(--muted);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+    }
+    th, td {
+      text-align: left;
+      padding: 14px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 12px;
+    }
+    tr:first-child td {
+      color: #d1fae5;
+    }
+    .badge {
+      display: inline-block;
+      margin-top: 16px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(34, 197, 94, 0.12);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Wikipedia Domain Leaderboard</h1>
+    <p>Live top 3 edited domains from the SSE stream. Auto-refreshes every 2 seconds.</p>
+    <table>
+      <thead>
+        <tr><th>Rank</th><th>Domain</th><th>Edits</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>commons.wikimedia.org</td><td>742</td></tr><tr><td>2</td><td>zh.wikisource.org</td><td>339</td></tr><tr><td>3</td><td>www.wikidata.org</td><td>190</td></tr>
+      </tbody>
+    </table>
+    <div class="badge">Live shared leaderboard</div>
+  </div>
+</body>
+</html>
