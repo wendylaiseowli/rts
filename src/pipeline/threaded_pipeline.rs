@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CHANNEL_CAPACITY: usize = 2;
 const DEADLINE: Duration = Duration::from_millis(2);
-const JITTER_THRESHOLD: Duration = Duration::from_millis(1);
+const JITTER_THRESHOLD: Duration = Duration::from_micros(1);
 const REPORT_EVERY: u64 = 100;
 
 #[derive(Clone)]
@@ -329,18 +329,22 @@ fn process_change_thread(
         } else {
             EditLane::Human
         };
+        let context = change_context(&change);
         log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
         log_line(format!(
-            "⏱ {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
-            label, actual_processing_time, DEADLINE, scheduling_drift_ns
+            "⏱ {} {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
+            label, context, actual_processing_time, DEADLINE, scheduling_drift_ns
         ));
         if actual_processing_time > DEADLINE {
             log_line(format!(
-                "⛔ DEADLINE MISSED: {:?} (limit: {:?})",
-                actual_processing_time, DEADLINE
+                "⛔ DEADLINE MISSED {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
+                context, actual_processing_time, DEADLINE, scheduling_drift_ns
             ));
         } else {
-            log_line(format!("✅ Deadline met: {:?}", actual_processing_time));
+            log_line(format!(
+                "✅ Deadline met {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
+                context, actual_processing_time, DEADLINE, scheduling_drift_ns
+            ));
         }
         return ProcessSample {
             lane,
@@ -380,6 +384,15 @@ fn change_summary(change: &WikiChange<'_>) -> String {
     format!(
         "event id={} user={:?} bot={:?} server={:?}",
         event_id, change.user, change.bot, change.server_name
+    )
+}
+
+fn change_context(change: &WikiChange<'_>) -> String {
+    format!(
+        "user={:?} bot={:?} server={:?}",
+        change.user,
+        change.bot,
+        change.server_name
     )
 }
 
