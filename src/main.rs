@@ -2,11 +2,13 @@ mod logging;
 mod metrics;
 mod pipeline;
 mod types;
+use logging::init_log_file;
 use pipeline::async_pipeline::run_async_pipeline;
 use pipeline::threaded_pipeline::run_threaded_pipeline;
 
 #[tokio::main]
 async fn main() {
+    init_log_file();
     let mode = "threaded"; // change to "threaded"
 
     if mode == "async" {

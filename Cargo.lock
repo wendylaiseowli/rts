@@ -9,6 +9,7 @@ dependencies = [
  "bytes",
  "criterion",
  "futures-util",
+ "plotters",
  "reqwest",
  "serde",
  "serde_json",

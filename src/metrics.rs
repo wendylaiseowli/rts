@@ -1,9 +1,13 @@
 use crate::logging::log_line;
+use plotters::prelude::*;
+use plotters::series::DashedLineSeries;
+use plotters::series::LineSeries;
 use std::collections::HashMap;
 use std::fs;
 use std::time::Duration;
 
 const DEFAULT_LEADERBOARD_HTML_PATH: &str = "leaderboard_dashboard.html";
+const DEFAULT_DRIFT_SVG_PATH: &str = "scheduling_drift_over_time.svg";
 
 #[derive(Debug, Default, Clone)]
 pub struct DriftStats {
@@ -14,11 +18,32 @@ pub struct DriftStats {
     total_processing_time: Duration,
     max_processing_time: Duration,
     deadline_misses: u64,
+    max_jitter: Duration,
+    jitter_breaches: u64,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct DomainLeaderboard {
     counts: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditLane {
+    Human,
+    Bot,
+}
+
+#[derive(Debug, Clone)]
+struct DriftPoint {
+    index: u64,
+    lane: EditLane,
+    drift_ns: i128,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DriftTimeline {
+    samples: Vec<DriftPoint>,
+    next_index: u64,
 }
 
 impl DomainLeaderboard {
@@ -56,7 +81,7 @@ impl DomainLeaderboard {
             .join("");
 
         let html = format!(
-            r#"<!doctype html>
+            r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -146,10 +171,144 @@ impl DomainLeaderboard {
     <div class="badge">Live shared leaderboard</div>
   </div>
 </body>
-</html>"#
+</html>"##
         );
 
         fs::write(path, html)
+    }
+}
+
+impl DriftTimeline {
+    pub fn record(&mut self, lane: EditLane, drift_ns: i128) {
+        self.samples.push(DriftPoint {
+            index: self.next_index,
+            lane,
+            drift_ns,
+        });
+        self.next_index = self.next_index.saturating_add(1);
+    }
+
+    pub fn write_svg(&self, path: Option<&str>) -> std::io::Result<()> {
+        let path = path.unwrap_or(DEFAULT_DRIFT_SVG_PATH);
+        let backend = SVGBackend::new(path, (1280, 720));
+        let root = backend.into_drawing_area();
+        root.fill(&RGBColor(11, 16, 32))
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        let mut points: Vec<&DriftPoint> = self.samples.iter().collect();
+        points.sort_by_key(|point| point.index);
+
+        let title_style = ("Arial", 30).into_font().color(&WHITE);
+        let subtitle_style = ("Arial", 14).into_font().color(&RGBColor(148, 163, 184));
+        root.draw(&Text::new(
+            "Scheduling Drift Over Time",
+            (48, 40),
+            title_style,
+        ))
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        root.draw(&Text::new(
+            "Positive values mean the packet exceeded the 2 ms budget; negative values finished early.",
+            (48, 66),
+            subtitle_style,
+        ))
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        if points.is_empty() {
+            root.present()
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            return Ok(());
+        }
+
+        let mut human_series = Vec::<(u64, f64)>::new();
+        let mut bot_series = Vec::<(u64, f64)>::new();
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+
+        for point in &points {
+            let drift_ms = point.drift_ns as f64 / 1_000_000.0;
+            min_y = min_y.min(drift_ms);
+            max_y = max_y.max(drift_ms);
+            match point.lane {
+                EditLane::Human => human_series.push((point.index, drift_ms)),
+                EditLane::Bot => bot_series.push((point.index, drift_ms)),
+            }
+        }
+
+        min_y = min_y.min(0.0);
+        max_y = max_y.max(0.0);
+        if (max_y - min_y).abs() < 0.001 {
+            min_y -= 1.0;
+            max_y += 1.0;
+        } else {
+            let pad = ((max_y - min_y) * 0.10).max(0.25);
+            min_y -= pad;
+            max_y += pad;
+        }
+
+        let x_max = points.last().map(|p| p.index).unwrap_or(0);
+        let mut chart = ChartBuilder::on(&root)
+            .margin(24)
+            .x_label_area_size(50)
+            .y_label_area_size(70)
+            .build_cartesian_2d(0u64..x_max.saturating_add(1), min_y..max_y)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        chart
+            .configure_mesh()
+            .x_desc("Packet index over time")
+            .y_desc("Scheduling drift (ms) = actual processing time - 2 ms")
+            .axis_style(WHITE.mix(0.65))
+            .label_style(("Arial", 12).into_font().color(&RGBColor(148, 163, 184)))
+            .light_line_style(RGBColor(36, 48, 65))
+            .bold_line_style(RGBColor(36, 48, 65))
+            .draw()
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        chart
+            .draw_series(LineSeries::new(
+                human_series.iter().copied(),
+                RGBColor(34, 197, 94),
+            ))
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?
+            .label(format!("Human ({})", human_series.len()))
+            .legend(|(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], RGBColor(34, 197, 94))
+            });
+
+        chart
+            .draw_series(DashedLineSeries::new(
+                bot_series.iter().copied(),
+                10,
+                8,
+                RGBColor(96, 165, 250).into(),
+            ))
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?
+            .label(format!("Bot ({})", bot_series.len()))
+            .legend(|(x, y)| {
+                PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle::from(&RGBColor(96, 165, 250)).stroke_width(2),
+                )
+            });
+
+        chart
+            .draw_series(std::iter::once(PathElement::new(
+                vec![(0, 0.0), (x_max.saturating_add(1), 0.0)],
+                RGBColor(245, 158, 11).stroke_width(2),
+            )))
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        chart
+            .configure_series_labels()
+            .background_style(RGBColor(17, 24, 39).mix(0.9))
+            .border_style(RGBColor(36, 48, 65))
+            .label_font(("Arial", 12).into_font().color(&WHITE))
+            .draw()
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        root.present()
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        Ok(())
     }
 }
 
@@ -186,6 +345,15 @@ impl DriftStats {
         self.processed
     }
 
+    pub fn observe_jitter(&mut self, jitter: Duration, threshold: Duration) -> bool {
+        self.max_jitter = self.max_jitter.max(jitter);
+        if jitter > threshold {
+            self.jitter_breaches += 1;
+            return true;
+        }
+        false
+    }
+
     pub fn report(&self) {
         if self.processed == 0 {
             return;
@@ -197,14 +365,17 @@ impl DriftStats {
             Duration::from_secs_f64(self.total_processing_time.as_secs_f64() / count);
 
         log_line(format!(
-            "DRIFT REPORT count={} avg_expected=2ms avg_actual_processing_time={:?} avg_scheduling_drift_ns={:.0} max_scheduling_drift_ns={} min_scheduling_drift_ns={} max_processing_time={:?} deadline_misses={}",
+            "DRIFT REPORT count={} avg_expected=2ms avg_actual_processing_time={:?} avg_scheduling_drift_ns={:.0} max_scheduling_drift_ns={} min_scheduling_drift_ns={} max_processing_time={:?} deadline_misses={} max_jitter={:?} jitter_breaches={}",
             self.processed,
             avg_processing_time,
             avg_scheduling_drift_ns,
             self.max_scheduling_drift_ns,
             self.min_scheduling_drift_ns,
             self.max_processing_time,
-            self.deadline_misses
+            self.deadline_misses,
+            self.max_jitter,
+            self.jitter_breaches
         ));
     }
 }
+

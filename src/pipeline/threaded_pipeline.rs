@@ -1,16 +1,18 @@
 use crate::logging::{log_error, log_line};
-use crate::metrics::{DomainLeaderboard, DriftStats};
+use crate::metrics::{DomainLeaderboard, DriftStats, DriftTimeline, EditLane};
 use crate::types::WikiChange;
 use bytes::Bytes;
 use reqwest::blocking::Client;
 use std::io::Read;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CHANNEL_CAPACITY: usize = 2;
 const DEADLINE: Duration = Duration::from_millis(2);
+const JITTER_THRESHOLD: Duration = Duration::from_millis(1);
 const REPORT_EVERY: u64 = 100;
 
 #[derive(Clone)]
@@ -19,6 +21,7 @@ struct QueuedChange {
 }
 
 struct ProcessSample {
+    lane: EditLane,
     scheduling_drift_ns: i128,
     processing_time: Duration,
 }
@@ -33,20 +36,27 @@ pub fn run_threaded_pipeline() {
     let rx_human = Arc::new(Mutex::new(rx_human));
     let rx_bot = Arc::new(Mutex::new(rx_bot));
     let leaderboard = Arc::new(Mutex::new(DomainLeaderboard::default()));
+    let drift_history = Arc::new(Mutex::new(DriftTimeline::default()));
+    let degraded_mode = Arc::new(AtomicBool::new(false));
 
     let tx_human_clone = tx_human.clone();
     let tx_bot_clone = tx_bot.clone();
     let rx_human_for_drop = Arc::clone(&rx_human);
     let rx_bot_for_drop = Arc::clone(&rx_bot);
     let leaderboard_for_drop = Arc::clone(&leaderboard);
+    let drift_history_for_worker = Arc::clone(&drift_history);
+    let degraded_mode_for_drop = Arc::clone(&degraded_mode);
 
     // Worker thread: always prioritize human edits.
     let worker_handle = {
         let rx_human = rx_human.clone();
         let rx_bot = rx_bot.clone();
         let leaderboard = Arc::clone(&leaderboard);
+        let drift_history = Arc::clone(&drift_history_for_worker);
+        let degraded_mode = Arc::clone(&degraded_mode);
         thread::spawn(move || {
             let mut stats = DriftStats::default();
+            let mut previous_processing_time: Option<Duration> = None;
 
             loop {
                 let Some(message) = recv_prioritized(&rx_human, &rx_bot) else {
@@ -54,6 +64,10 @@ pub fn run_threaded_pipeline() {
                 };
 
                 let mut message = message;
+                if degraded_mode.load(Ordering::Relaxed) && is_bot_packet(&message) {
+                    log_line("DEGRADED MODE: dropping BOT packet to keep the system stable.");
+                    continue;
+                }
                 if is_bot_packet(&message) {
                     if let Some(human_packet) = try_recv_human_now(&rx_human) {
                         log_line("🚫 BOT OVERRIDDEN by a newly arrived HUMAN packet.");
@@ -65,11 +79,29 @@ pub fn run_threaded_pipeline() {
                 let deadline_start = Instant::now();
                 let sample = process_change_thread(message, deadline_start);
                 stats.record(sample.scheduling_drift_ns, sample.processing_time, DEADLINE);
+                if let Some(previous) = previous_processing_time {
+                    let jitter = sample.processing_time.abs_diff(previous);
+                    if stats.observe_jitter(jitter, JITTER_THRESHOLD)
+                        && !degraded_mode.swap(true, Ordering::SeqCst)
+                    {
+                        log_line(format!(
+                            "DEGRADED MODE ENTERED: processing jitter {:?} exceeded threshold {:?}.",
+                            jitter, JITTER_THRESHOLD
+                        ));
+                    }
+                }
+                previous_processing_time = Some(sample.processing_time);
+                if let Ok(mut history) = drift_history.lock() {
+                    history.record(sample.lane, sample.scheduling_drift_ns);
+                }
 
                 if stats.processed() % REPORT_EVERY == 0 {
                     stats.report();
                     if let Ok(lb) = leaderboard.lock() {
                         let _ = lb.write_html(None);
+                    }
+                    if let Ok(history) = drift_history.lock() {
+                        let _ = history.write_svg(None);
                     }
                 }
             }
@@ -78,85 +110,117 @@ pub fn run_threaded_pipeline() {
             if let Ok(lb) = leaderboard.lock() {
                 let _ = lb.write_html(None);
             }
+            if let Ok(history) = drift_history.lock() {
+                let _ = history.write_svg(None);
+            }
         })
     };
     // Producer thread.
     let producer_handle = thread::spawn(move || {
-        let client = Client::new();
-        let response = match client
-            .get(url)
-            .header("User-Agent", "WendyRTSProject/1.0")
-            .send()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                log_error(format!("Failed to connect: {:?}", e));
-                return;
-            }
-        };
-
-        let mut buffer = Vec::new();
-        let mut reader = response;
-
         loop {
-            buffer.clear();
-            match reader.by_ref().take(4096).read_to_end(&mut buffer) {
-                Ok(0) => break,
-                Ok(_) => {
-                    for line in buffer.split(|&b| b == b'\n') {
-                        if line.starts_with(b"data: ") {
-                            let json_bytes = Bytes::copy_from_slice(&line[6..]);
+            let client = match Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    log_error(format!("Failed to build client: {:?}", e));
+                    return;
+                }
+            };
 
-                            if let Ok(change) =
-                                serde_json::from_slice::<WikiChange<'_>>(&json_bytes)
-                            {
-                                let lane = if change.bot.unwrap_or(false) {
-                                    "BOT"
-                                } else {
-                                    "HUMAN"
-                                };
-                                let summary = change_summary(&change);
-                                log_line(format!("📥 INCOMING {} {}", lane, summary));
-                                let domain = domain_key(&change);
-                                if let Ok(mut lb) = leaderboard_for_drop.lock() {
-                                    lb.record(&domain);
-                                }
+            log_line("?? Connecting to Wikipedia SSE stream...");
+            let response = match client
+                .get(url)
+                .header("User-Agent", "WendyRTSProject/1.0")
+                .send()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    log_error(format!("Failed to connect: {:?}", e));
+                    log_line("?? Network Reset: reconnecting after connection failure.");
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            };
 
-                                let packet = QueuedChange {
-                                    payload: json_bytes.clone(),
-                                };
+            let mut buffer = Vec::new();
+            let mut reader = response;
 
-                                let sent = if change.bot.unwrap_or(false) {
-                                    send_with_drop_oldest(
-                                        &tx_bot_clone,
-                                        &rx_bot_for_drop,
-                                        packet,
-                                        lane,
-                                        &summary,
-                                    )
-                                } else {
-                                    send_with_drop_oldest(
-                                        &tx_human_clone,
-                                        &rx_human_for_drop,
-                                        packet,
-                                        lane,
-                                        &summary,
-                                    )
-                                };
+            loop {
+                buffer.clear();
+                match reader.by_ref().take(4096).read_to_end(&mut buffer) {
+                    Ok(0) => {
+                        log_line("?? Network Reset: stream ended, reconnecting.");
+                        break;
+                    }
+                    Ok(_) => {
+                        for line in buffer.split(|&b| b == b'\n') {
+                            if line.starts_with(b"data: ") {
+                                let json_bytes = Bytes::copy_from_slice(&line[6..]);
 
-                                if !sent {
-                                    eprintln!("{} channel closed; stopping producer thread", lane);
-                                    return;
+                                if let Ok(change) =
+                                    serde_json::from_slice::<WikiChange<'_>>(&json_bytes)
+                                {
+                                    let lane = if change.bot.unwrap_or(false) {
+                                        "BOT"
+                                    } else {
+                                        "HUMAN"
+                                    };
+                                    let summary = change_summary(&change);
+                                    log_line(format!("?? INCOMING {} {}", lane, summary));
+                                    if degraded_mode_for_drop.load(Ordering::Relaxed)
+                                        && change.bot.unwrap_or(false)
+                                    {
+                                        log_line(
+                                            "DEGRADED MODE: dropping incoming BOT packet before enqueue.",
+                                        );
+                                        continue;
+                                    }
+                                    let domain = domain_key(&change);
+                                    if let Ok(mut lb) = leaderboard_for_drop.lock() {
+                                        lb.record(&domain);
+                                    }
+
+                                    let packet = QueuedChange {
+                                        payload: json_bytes.clone(),
+                                    };
+
+                                    let sent = if change.bot.unwrap_or(false) {
+                                        send_with_drop_oldest(
+                                            &tx_bot_clone,
+                                            &rx_bot_for_drop,
+                                            packet,
+                                            lane,
+                                            &summary,
+                                        )
+                                    } else {
+                                        send_with_drop_oldest(
+                                            &tx_human_clone,
+                                            &rx_human_for_drop,
+                                            packet,
+                                            lane,
+                                            &summary,
+                                        )
+                                    };
+
+                                    if !sent {
+                                        eprintln!("{} channel closed; stopping producer thread", lane);
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    log_error(format!("Failed to read from stream: {:?}", e));
-                    break;
+                    Err(e) => {
+                        log_error(format!("Failed to read from stream: {:?}", e));
+                        log_line("?? Network Reset: no data for 10 seconds, reconnecting.");
+                        break;
+                    }
                 }
             }
+
+            thread::sleep(Duration::from_secs(1));
         }
     });
 
@@ -260,23 +324,33 @@ fn process_change_thread(
         } else {
             "HUMAN"
         };
+        let lane = if change.bot.unwrap_or(false) {
+            EditLane::Bot
+        } else {
+            EditLane::Human
+        };
         log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
         log_line(format!(
             "⏱ {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
             label, actual_processing_time, DEADLINE, scheduling_drift_ns
         ));
-    }
-
-    if actual_processing_time > DEADLINE {
-        log_line(format!(
-            "⛔ DEADLINE MISSED: {:?} (limit: {:?})",
-            actual_processing_time, DEADLINE
-        ));
-    } else {
-        log_line(format!("✅ Deadline met: {:?}", actual_processing_time));
+        if actual_processing_time > DEADLINE {
+            log_line(format!(
+                "⛔ DEADLINE MISSED: {:?} (limit: {:?})",
+                actual_processing_time, DEADLINE
+            ));
+        } else {
+            log_line(format!("✅ Deadline met: {:?}", actual_processing_time));
+        }
+        return ProcessSample {
+            lane,
+            scheduling_drift_ns,
+            processing_time: actual_processing_time,
+        };
     }
 
     ProcessSample {
+        lane: EditLane::Human,
         scheduling_drift_ns,
         processing_time: actual_processing_time,
     }
@@ -339,4 +413,5 @@ fn log_overflow_event(lane: &str, dropped_summary: &str, incoming_summary: &str)
         incoming_summary
     ));
 }
+
 
