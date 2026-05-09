@@ -1,0 +1,3 @@
+architecture,count,mean_ns,p50_ns,p95_ns,p99_ns,max_ns
+async,12000,22005,19000,22100,118700,535700
+threaded,12000,14708,14500,15600,18700,57000

@@ -72,6 +72,9 @@ pub fn run_threaded_pipeline() {
                     log_line("DEGRADED MODE: dropping BOT packet to keep the system stable.");
                     continue;
                 }
+
+                log_dequeue_event(&message);
+
                 if is_bot_packet(&message) {
                     if let Some(human_packet) = try_recv_human_now(&rx_human) {
                         log_line("🚫 BOT OVERRIDDEN by a newly arrived HUMAN packet.");
@@ -136,6 +139,9 @@ pub fn run_threaded_pipeline() {
     // Producer thread.
     let producer_handle = thread::spawn(move || {
         loop {
+            let watchdog_timeout = Duration::from_secs(10);
+            let mut last_data_received = Instant::now();
+
             let client = match Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -156,7 +162,7 @@ pub fn run_threaded_pipeline() {
                 Ok(r) => r,
                 Err(e) => {
                     log_error(format!("Failed to connect: {:?}", e));
-                    log_line("?? Network Reset: reconnecting after connection failure.");
+                    log_line("Network Reset: reconnecting after connection failure.");
                     thread::sleep(Duration::from_secs(1));
                     continue;
                 }
@@ -166,6 +172,12 @@ pub fn run_threaded_pipeline() {
             let mut reader = response;
 
             loop {
+                // Active watchdog: check if 10 seconds have passed since last data
+                if last_data_received.elapsed() >= watchdog_timeout {
+                    log_line("?? Network Reset: no data for 10 seconds, triggering reconnect.");
+                    break;
+                }
+
                 buffer.clear();
                 match reader.by_ref().take(4096).read_to_end(&mut buffer) {
                     Ok(0) => {
@@ -173,6 +185,7 @@ pub fn run_threaded_pipeline() {
                         break;
                     }
                     Ok(_) => {
+                        last_data_received = Instant::now();
                         for line in buffer.split(|&b| b == b'\n') {
                             if line.starts_with(b"data: ") {
                                 let json_bytes = Bytes::copy_from_slice(&line[6..]);
@@ -230,7 +243,11 @@ pub fn run_threaded_pipeline() {
                     }
                     Err(e) => {
                         log_error(format!("Failed to read from stream: {:?}", e));
-                        log_line("?? Network Reset: no data for 10 seconds, reconnecting.");
+                        if last_data_received.elapsed() >= watchdog_timeout {
+                            log_line("?? Network Reset: no data for 10 seconds, reconnecting.");
+                        } else {
+                            log_line("?? Network Reset: reconnecting after read error.");
+                        }
                         break;
                     }
                 }
@@ -344,7 +361,6 @@ fn process_change_thread(
         let actual_processing_time = deadline_start.elapsed();
         let scheduling_drift_ns =
             actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
-        log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
         log_line(format!(
             "⏱ {} {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
             label, context, actual_processing_time, DEADLINE, scheduling_drift_ns
@@ -391,8 +407,8 @@ fn try_recv_human_now(
 fn change_summary(change: &WikiChange<'_>) -> String {
     let view = hot_path_view(change);
     format!(
-        "event id={} user={:?} bot={:?} server={:?}",
-        view.event_id.unwrap_or("unknown"), view.user, change.bot, view.server_name
+        "event id={} user={:?} bot={:?} server={:?} title={:?}",
+        view.event_id.unwrap_or("unknown"), view.user, change.bot, view.server_name, view.title
     )
 }
 
@@ -422,6 +438,13 @@ fn is_bot_packet(packet: &QueuedChange) -> bool {
         .unwrap_or(false)
 }
 
+fn log_dequeue_event(packet: &QueuedChange) {
+    if let Ok(change) = parse_wiki_change(&packet.payload) {
+        let label = if is_bot(&change) { "BOT" } else { "HUMAN" };
+        log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
+    }
+}
+
 fn log_overflow_event(lane: &str, dropped_summary: &str, incoming_summary: &str) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -435,5 +458,6 @@ fn log_overflow_event(lane: &str, dropped_summary: &str, incoming_summary: &str)
         incoming_summary
     ));
 }
+
 
 

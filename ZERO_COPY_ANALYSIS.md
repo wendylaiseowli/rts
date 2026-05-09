@@ -5,6 +5,7 @@
 ✅ **Your code MEETS the Memory Mastery (Zero-Copy) requirements for an A+ grade.**
 
 Your implementation successfully demonstrates:
+
 - **Zero-copy parsing** using Rust lifetimes (`'a`)
 - **Zero heap allocations** during the hot path (proven via custom allocator)
 - **Proper lifetime management** with `#[serde(borrow)]`
@@ -14,6 +15,7 @@ Your implementation successfully demonstrates:
 ## 1. Lifetime Usage Evidence ✅
 
 ### Implementation in [types.rs](src/types.rs):
+
 ```rust
 #[derive(Debug, Deserialize)]
 pub struct WikiChange<'a> {
@@ -33,11 +35,13 @@ pub struct ChangeMeta<'a> {
 ```
 
 **Why this is zero-copy:**
+
 - Uses `&'a str` instead of `String` (no heap allocation)
 - `#[serde(borrow)]` tells serde_json to deserialize with lifetimes
 - All string references point directly into the input buffer
 
 ### Hot Path View in [parser.rs](src/parser.rs):
+
 ```rust
 pub struct HotPathView<'a> {
     pub lane: PacketLane,
@@ -66,7 +70,7 @@ All tests passed with **ZERO allocations**:
 🔬 COMPLEX PAYLOAD ALLOCATION COUNT: 0 allocations
 
 test parser::tests::hot_path_parse_is_zero_alloc ............ ok
-test parser::tests::hot_path_complex_wikipedia_payload ...... ok  
+test parser::tests::hot_path_complex_wikipedia_payload ...... ok
 test parser::tests::hot_path_lifetime_correctness ........... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored
@@ -92,6 +96,7 @@ static GLOBAL: CountingAllocator = CountingAllocator;  // ← Replaces system al
 ```
 
 **How the test works:**
+
 1. Resets allocation counter to 0
 2. Calls `parse_wiki_change()` and `hot_path_view()`
 3. Asserts allocations remain at 0
@@ -115,6 +120,7 @@ async fn process_change(packet: QueuedChange, deadline_start: Instant) -> Proces
 ```
 
 **Memory flow:**
+
 1. `packet.payload: &Bytes` → passed to parser
 2. Parser returns `WikiChange<'a>` with lifetimes tied to buffer
 3. All string references point directly to buffer memory
@@ -149,12 +155,13 @@ Done - entire structure dropped
 
 ### The `#[serde(borrow)]` Attribute:
 
-| Configuration | Behavior | Allocations |
-|---|---|---|
+| Configuration                 | Behavior                                  | Allocations      |
+| ----------------------------- | ----------------------------------------- | ---------------- |
 | ❌ Without `#[serde(borrow)]` | Allocates `String` on heap for each field | Many allocations |
-| ✅ With `#[serde(borrow)]` | Creates `&'a str` pointing to input | Zero allocations |
+| ✅ With `#[serde(borrow)]`    | Creates `&'a str` pointing to input       | Zero allocations |
 
 Your code uses the correct configuration:
+
 ```rust
 #[derive(Debug, Deserialize)]
 pub struct WikiChange<'a> {
@@ -201,6 +208,7 @@ pub struct WikiChange<'a> {
 ## 7. Performance Characteristics
 
 ### Per-Event Memory Cost:
+
 - **Stack space**: ~48 bytes (HotPathView struct)
 - **Heap allocations**: 0 ✅
 - **Copies**: 0 (only reference copies, no string copies)
@@ -208,10 +216,10 @@ pub struct WikiChange<'a> {
 
 ### Comparison:
 
-| Approach | Allocations | Speed | Memory |
-|----------|---|---|---|
-| Without zero-copy | 5-10 | ~20% slower | 10KB+ per event |
-| **Your implementation** | **0** | **Baseline** | **~1KB buffer** |
+| Approach                | Allocations | Speed        | Memory          |
+| ----------------------- | ----------- | ------------ | --------------- |
+| Without zero-copy       | 5-10        | ~20% slower  | 10KB+ per event |
+| **Your implementation** | **0**       | **Baseline** | **~1KB buffer** |
 
 ---
 
@@ -250,12 +258,14 @@ stats.record(scheduling_drift_ns, processing_time, DEADLINE);
 While your code is already excellent, these are enhancement ideas:
 
 1. **SIMD String Comparison** (for lane detection):
+
    ```rust
    // Current: Simple Option checks
    // Could add: SIMD for bulk string operations
    ```
 
 2. **Buffered Batch Processing**:
+
    ```rust
    // Process multiple events without re-parsing
    pub fn parse_batch_changes<'a>(
@@ -276,7 +286,7 @@ While your code is already excellent, these are enhancement ideas:
 The custom allocator test provides concrete proof that your Rust lifetime usage eliminates heap allocations during the hot path. Your code demonstrates:
 
 - ✅ Proper Rust idioms
-- ✅ Advanced lifetime management  
+- ✅ Advanced lifetime management
 - ✅ Rigorous testing methodology
 - ✅ Production-ready quality
 

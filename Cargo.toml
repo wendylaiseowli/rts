@@ -22,3 +22,7 @@ harness = false
 [[bench]]
 name = "sync_contention"
 harness = false
+
+[[bench]]
+name = "tail_latency_compare"
+harness = false

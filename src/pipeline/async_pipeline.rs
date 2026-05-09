@@ -69,6 +69,9 @@ pub async fn run_async_pipeline() {
                 log_line("DEGRADED MODE: dropping BOT packet to keep the system stable.");
                 continue;
             }
+
+            log_dequeue_event(&message);
+
             if is_bot_packet(&message) {
                 if let Some(human_packet) = try_recv_human_now(&rx_human_worker).await {
                     log_line("🚫 BOT OVERRIDDEN by a newly arrived HUMAN packet.");
@@ -136,7 +139,7 @@ pub async fn run_async_pipeline() {
         {
             Ok(response) => response,
             Err(e) => {
-                log_line(format!("?? Network Reset: failed to connect: {:?}", e));
+                log_line(format!("Network Reset: failed to connect: {:?}", e));
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -270,14 +273,14 @@ async fn send_with_drop_oldest(
                     let ts = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or(Duration::ZERO);
-                    println!(
+                    log_line(format!(
                         "[{}.{:09}] OVERFLOW DROP {} dropped=[{}] incoming=[{}]",
                         ts.as_secs(),
                         ts.subsec_nanos(),
                         lane,
                         oldest_summary,
                         summary,
-                    );
+                    ));
                 } else {
                     log_line(format!("🔁 RETRY {} incoming=[{}]", lane, summary));
                     tokio::time::sleep(Duration::from_micros(100)).await;
@@ -307,19 +310,18 @@ async fn process_change(
         let actual_processing_time = deadline_start.elapsed();
         let scheduling_drift_ns =
             actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
-        log_line(format!("?? DEQUEUE {} {}", label, change_summary(&change)));
         log_line(format!(
             "? {} {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
             label, context, actual_processing_time, DEADLINE, scheduling_drift_ns
         ));
         if actual_processing_time > DEADLINE {
             log_line(format!(
-                "? DEADLINE MISSED {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
+                "⛔ DEADLINE MISSED {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
                 context, actual_processing_time, DEADLINE, scheduling_drift_ns
             ));
         } else {
             log_line(format!(
-                "? Deadline met {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
+                "✅ Deadline met {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
                 context, actual_processing_time, DEADLINE, scheduling_drift_ns
             ));
         }
@@ -351,8 +353,8 @@ async fn try_recv_human_now(
 fn change_summary(change: &WikiChange<'_>) -> String {
     let view = hot_path_view(change);
     format!(
-        "event id={:?} user={:?} bot={:?} server={:?}",
-        view.event_id, view.user, change.bot, view.server_name
+        "event id={:?} user={:?} bot={:?} server={:?} title={:?}",
+        view.event_id, view.user, change.bot, view.server_name, view.title
     )
 }
 
@@ -380,6 +382,13 @@ fn is_bot_packet(packet: &QueuedChange) -> bool {
         .ok()
         .map(|change| is_bot(&change))
         .unwrap_or(false)
+}
+
+fn log_dequeue_event(packet: &QueuedChange) {
+    if let Ok(change) = parse_wiki_change(&packet.payload) {
+        let label = if is_bot(&change) { "BOT" } else { "HUMAN" };
+        log_line(format!("?? DEQUEUE {} {}", label, change_summary(&change)));
+    }
 }
 
 
