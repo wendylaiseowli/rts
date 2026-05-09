@@ -8,6 +8,7 @@ use std::time::Duration;
 
 const DEFAULT_LEADERBOARD_HTML_PATH: &str = "leaderboard_dashboard.html";
 const DEFAULT_DRIFT_SVG_PATH: &str = "scheduling_drift_over_time.svg";
+const DEFAULT_LANE_DRIFT_HTML_PATH: &str = "lane_drift_summary.html";
 
 #[derive(Debug, Default, Clone)]
 pub struct DriftStats {
@@ -44,6 +45,21 @@ struct DriftPoint {
 pub struct DriftTimeline {
     samples: Vec<DriftPoint>,
     next_index: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct LaneDriftStats {
+    human: LaneStats,
+    bot: LaneStats,
+}
+
+#[derive(Debug, Default, Clone)]
+struct LaneStats {
+    count: u64,
+    total_drift_ns: i128,
+    max_drift_ns: i128,
+    min_drift_ns: i128,
+    deadline_misses: u64,
 }
 
 impl DomainLeaderboard {
@@ -309,6 +325,145 @@ impl DriftTimeline {
         root.present()
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         Ok(())
+    }
+}
+
+impl LaneDriftStats {
+    pub fn record(
+        &mut self,
+        lane: EditLane,
+        scheduling_drift_ns: i128,
+        processing_time: Duration,
+        deadline: Duration,
+    ) {
+        let stats = match lane {
+            EditLane::Human => &mut self.human,
+            EditLane::Bot => &mut self.bot,
+        };
+
+        stats.count += 1;
+        stats.total_drift_ns += scheduling_drift_ns;
+        stats.max_drift_ns = stats.max_drift_ns.max(scheduling_drift_ns);
+        if stats.count == 1 || scheduling_drift_ns < stats.min_drift_ns {
+            stats.min_drift_ns = scheduling_drift_ns;
+        }
+        if processing_time > deadline {
+            stats.deadline_misses += 1;
+        }
+    }
+
+    pub fn write_html(&self, path: Option<&str>) -> std::io::Result<()> {
+        let path = path.unwrap_or(DEFAULT_LANE_DRIFT_HTML_PATH);
+
+        let rows = [
+            ("Human", &self.human, "#22c55e"),
+            ("Bot", &self.bot, "#60a5fa"),
+        ]
+        .into_iter()
+        .map(|(label, stats, accent)| {
+            let avg_drift_ns = if stats.count == 0 {
+                0.0
+            } else {
+                stats.total_drift_ns as f64 / stats.count as f64
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{:.0}</td><td>{}</td><td>{}</td><td style=\"color:{}\">{}</td></tr>",
+                label,
+                stats.count,
+                avg_drift_ns,
+                stats.max_drift_ns,
+                stats.min_drift_ns,
+                accent,
+                stats.deadline_misses
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+        let html = format!(
+            r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="2" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lane Drift Summary</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #111827;
+      --line: #243041;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+    }}
+    body {{
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: radial-gradient(circle at top, #172033 0, var(--bg) 50%);
+      color: var(--text);
+      padding: 32px;
+    }}
+    .card {{
+      max-width: 900px;
+      margin: 0 auto;
+      background: rgba(17, 24, 39, 0.92);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+    }}
+    h1 {{
+      margin: 0 0 8px 0;
+      font-size: 28px;
+    }}
+    p {{
+      margin: 0 0 20px 0;
+      color: var(--muted);
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+    }}
+    th, td {{
+      text-align: left;
+      padding: 14px 12px;
+      border-bottom: 1px solid var(--line);
+    }}
+    th {{
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 12px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Human vs Bot Scheduling Drift</h1>
+    <p>Human edits should show lower drift because the worker prioritizes them over bot edits.</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Lane</th>
+          <th>Packets</th>
+          <th>Avg Drift (ns)</th>
+          <th>Max Drift (ns)</th>
+          <th>Min Drift (ns)</th>
+          <th>Deadline Misses</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>"##
+        );
+
+        fs::write(path, html)
     }
 }
 

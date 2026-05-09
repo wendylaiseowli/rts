@@ -1,4 +1,5 @@
 mod logging;
+mod parser;
 mod metrics;
 mod pipeline;
 mod types;

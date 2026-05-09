@@ -1,5 +1,6 @@
 use crate::logging::{log_error, log_line};
-use crate::metrics::{DomainLeaderboard, DriftStats, DriftTimeline, EditLane};
+use crate::parser::{hot_path_view, is_bot, parse_wiki_change, packet_lane, server_name};
+use crate::metrics::{DomainLeaderboard, DriftStats, DriftTimeline, EditLane, LaneDriftStats};
 use crate::types::WikiChange;
 use bytes::Bytes;
 use reqwest::blocking::Client;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CHANNEL_CAPACITY: usize = 2;
 const DEADLINE: Duration = Duration::from_millis(2);
-const JITTER_THRESHOLD: Duration = Duration::from_micros(1);
+const JITTER_THRESHOLD: Duration = Duration::from_millis(1);
 const REPORT_EVERY: u64 = 100;
 
 #[derive(Clone)]
@@ -37,6 +38,7 @@ pub fn run_threaded_pipeline() {
     let rx_bot = Arc::new(Mutex::new(rx_bot));
     let leaderboard = Arc::new(Mutex::new(DomainLeaderboard::default()));
     let drift_history = Arc::new(Mutex::new(DriftTimeline::default()));
+    let lane_drift = Arc::new(Mutex::new(LaneDriftStats::default()));
     let degraded_mode = Arc::new(AtomicBool::new(false));
 
     let tx_human_clone = tx_human.clone();
@@ -45,6 +47,7 @@ pub fn run_threaded_pipeline() {
     let rx_bot_for_drop = Arc::clone(&rx_bot);
     let leaderboard_for_drop = Arc::clone(&leaderboard);
     let drift_history_for_worker = Arc::clone(&drift_history);
+    let lane_drift_for_worker = Arc::clone(&lane_drift);
     let degraded_mode_for_drop = Arc::clone(&degraded_mode);
 
     // Worker thread: always prioritize human edits.
@@ -53,6 +56,7 @@ pub fn run_threaded_pipeline() {
         let rx_bot = rx_bot.clone();
         let leaderboard = Arc::clone(&leaderboard);
         let drift_history = Arc::clone(&drift_history_for_worker);
+        let lane_drift = Arc::clone(&lane_drift_for_worker);
         let degraded_mode = Arc::clone(&degraded_mode);
         thread::spawn(move || {
             let mut stats = DriftStats::default();
@@ -94,6 +98,14 @@ pub fn run_threaded_pipeline() {
                 if let Ok(mut history) = drift_history.lock() {
                     history.record(sample.lane, sample.scheduling_drift_ns);
                 }
+                if let Ok(mut report) = lane_drift.lock() {
+                    report.record(
+                        sample.lane,
+                        sample.scheduling_drift_ns,
+                        sample.processing_time,
+                        DEADLINE,
+                    );
+                }
 
                 if stats.processed() % REPORT_EVERY == 0 {
                     stats.report();
@@ -102,6 +114,9 @@ pub fn run_threaded_pipeline() {
                     }
                     if let Ok(history) = drift_history.lock() {
                         let _ = history.write_svg(None);
+                    }
+                    if let Ok(report) = lane_drift.lock() {
+                        let _ = report.write_html(None);
                     }
                 }
             }
@@ -112,6 +127,9 @@ pub fn run_threaded_pipeline() {
             }
             if let Ok(history) = drift_history.lock() {
                 let _ = history.write_svg(None);
+            }
+            if let Ok(report) = lane_drift.lock() {
+                let _ = report.write_html(None);
             }
         })
     };
@@ -159,25 +177,23 @@ pub fn run_threaded_pipeline() {
                             if line.starts_with(b"data: ") {
                                 let json_bytes = Bytes::copy_from_slice(&line[6..]);
 
-                                if let Ok(change) =
-                                    serde_json::from_slice::<WikiChange<'_>>(&json_bytes)
-                                {
-                                    let lane = if change.bot.unwrap_or(false) {
-                                        "BOT"
-                                    } else {
-                                        "HUMAN"
+                                if let Ok(change) = parse_wiki_change(&json_bytes) {
+                                    let view = hot_path_view(&change);
+                                    let lane = match view.lane {
+                                        crate::parser::PacketLane::Bot => "BOT",
+                                        crate::parser::PacketLane::Human => "HUMAN",
                                     };
                                     let summary = change_summary(&change);
                                     log_line(format!("?? INCOMING {} {}", lane, summary));
                                     if degraded_mode_for_drop.load(Ordering::Relaxed)
-                                        && change.bot.unwrap_or(false)
+                                        && is_bot(&change)
                                     {
                                         log_line(
                                             "DEGRADED MODE: dropping incoming BOT packet before enqueue.",
                                         );
                                         continue;
                                     }
-                                    let domain = domain_key(&change);
+                                    let domain = server_name(&change).to_string();
                                     if let Ok(mut lb) = leaderboard_for_drop.lock() {
                                         lb.record(&domain);
                                     }
@@ -186,7 +202,7 @@ pub fn run_threaded_pipeline() {
                                         payload: json_bytes.clone(),
                                     };
 
-                                    let sent = if change.bot.unwrap_or(false) {
+                                    let sent = if is_bot(&change) {
                                         send_with_drop_oldest(
                                             &tx_bot_clone,
                                             &rx_bot_for_drop,
@@ -314,22 +330,20 @@ fn process_change_thread(
     message: QueuedChange,
     deadline_start: Instant,
 ) -> ProcessSample {
-    let actual_processing_time = deadline_start.elapsed();
-    let scheduling_drift_ns =
-        actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
-
-    if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(&message.payload) {
-        let label = if change.bot.unwrap_or(false) {
+    if let Ok(change) = parse_wiki_change(&message.payload) {
+        let label = if is_bot(&change) {
             "BOT"
         } else {
             "HUMAN"
         };
-        let lane = if change.bot.unwrap_or(false) {
-            EditLane::Bot
-        } else {
-            EditLane::Human
+        let lane = match packet_lane(&change) {
+            crate::parser::PacketLane::Bot => EditLane::Bot,
+            crate::parser::PacketLane::Human => EditLane::Human,
         };
         let context = change_context(&change);
+        let actual_processing_time = deadline_start.elapsed();
+        let scheduling_drift_ns =
+            actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
         log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
         log_line(format!(
             "⏱ {} {} Actual={:?} Expected={:?} Scheduling Drift(ns)={}",
@@ -353,6 +367,10 @@ fn process_change_thread(
         };
     }
 
+    let actual_processing_time = deadline_start.elapsed();
+    let scheduling_drift_ns =
+        actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
+
     ProcessSample {
         lane: EditLane::Human,
         scheduling_drift_ns,
@@ -370,20 +388,11 @@ fn try_recv_human_now(
     }
 }
 
-fn domain_key(change: &WikiChange<'_>) -> String {
-    change.server_name.unwrap_or("unknown").to_string()
-}
-
 fn change_summary(change: &WikiChange<'_>) -> String {
-    let event_id = change
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.id)
-        .unwrap_or("unknown");
-
+    let view = hot_path_view(change);
     format!(
         "event id={} user={:?} bot={:?} server={:?}",
-        event_id, change.user, change.bot, change.server_name
+        view.event_id.unwrap_or("unknown"), view.user, change.bot, view.server_name
     )
 }
 
@@ -397,7 +406,7 @@ fn change_context(change: &WikiChange<'_>) -> String {
 }
 
 fn summarize_bytes(bytes: &Bytes) -> String {
-    if let Ok(change) = serde_json::from_slice::<WikiChange<'_>>(bytes) {
+    if let Ok(change) = parse_wiki_change(bytes) {
         change_summary(&change)
     } else if let Ok(text) = std::str::from_utf8(bytes) {
         text.chars().take(200).collect()
@@ -407,9 +416,9 @@ fn summarize_bytes(bytes: &Bytes) -> String {
 }
 
 fn is_bot_packet(packet: &QueuedChange) -> bool {
-    serde_json::from_slice::<WikiChange<'_>>(&packet.payload)
+    parse_wiki_change(&packet.payload)
         .ok()
-        .and_then(|change| change.bot)
+        .map(|change| is_bot(&change))
         .unwrap_or(false)
 }
 
