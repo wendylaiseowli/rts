@@ -10,7 +10,7 @@ use pipeline::threaded_pipeline::run_threaded_pipeline;
 #[tokio::main]
 async fn main() {
     init_log_file();
-    let mode = "async";
+    let mode = "threaded";
 
     if mode == "async" {
         println!("Running Async Pipeline...");

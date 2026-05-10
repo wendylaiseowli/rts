@@ -1,6 +1,6 @@
 use crate::logging::{log_error, log_line};
-use crate::parser::{hot_path_view, is_bot, parse_wiki_change, packet_lane, server_name};
-use crate::metrics::{DomainLeaderboard, DriftStats, DriftTimeline, EditLane, LaneDriftStats};
+use crate::parser::{hot_path_view, is_bot, parse_wiki_change, server_name};
+use crate::metrics::{DomainLeaderboard, DriftStats};
 use crate::types::WikiChange;
 use bytes::Bytes;
 use reqwest::blocking::Client;
@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const CHANNEL_CAPACITY: usize = 2;
 const DEADLINE: Duration = Duration::from_millis(2);
@@ -22,7 +22,6 @@ struct QueuedChange {
 }
 
 struct ProcessSample {
-    lane: EditLane,
     scheduling_drift_ns: i128,
     processing_time: Duration,
 }
@@ -37,8 +36,6 @@ pub fn run_threaded_pipeline() {
     let rx_human = Arc::new(Mutex::new(rx_human));
     let rx_bot = Arc::new(Mutex::new(rx_bot));
     let leaderboard = Arc::new(Mutex::new(DomainLeaderboard::default()));
-    let drift_history = Arc::new(Mutex::new(DriftTimeline::default()));
-    let lane_drift = Arc::new(Mutex::new(LaneDriftStats::default()));
     let degraded_mode = Arc::new(AtomicBool::new(false));
 
     let tx_human_clone = tx_human.clone();
@@ -46,8 +43,6 @@ pub fn run_threaded_pipeline() {
     let rx_human_for_drop = Arc::clone(&rx_human);
     let rx_bot_for_drop = Arc::clone(&rx_bot);
     let leaderboard_for_drop = Arc::clone(&leaderboard);
-    let drift_history_for_worker = Arc::clone(&drift_history);
-    let lane_drift_for_worker = Arc::clone(&lane_drift);
     let degraded_mode_for_drop = Arc::clone(&degraded_mode);
 
     // Worker thread: always prioritize human edits.
@@ -55,8 +50,6 @@ pub fn run_threaded_pipeline() {
         let rx_human = rx_human.clone();
         let rx_bot = rx_bot.clone();
         let leaderboard = Arc::clone(&leaderboard);
-        let drift_history = Arc::clone(&drift_history_for_worker);
-        let lane_drift = Arc::clone(&lane_drift_for_worker);
         let degraded_mode = Arc::clone(&degraded_mode);
         thread::spawn(move || {
             let mut stats = DriftStats::default();
@@ -98,28 +91,10 @@ pub fn run_threaded_pipeline() {
                     }
                 }
                 previous_processing_time = Some(sample.processing_time);
-                if let Ok(mut history) = drift_history.lock() {
-                    history.record(sample.lane, sample.scheduling_drift_ns);
-                }
-                if let Ok(mut report) = lane_drift.lock() {
-                    report.record(
-                        sample.lane,
-                        sample.scheduling_drift_ns,
-                        sample.processing_time,
-                        DEADLINE,
-                    );
-                }
-
                 if stats.processed() % REPORT_EVERY == 0 {
                     stats.report();
                     if let Ok(lb) = leaderboard.lock() {
                         let _ = lb.write_html(None);
-                    }
-                    if let Ok(history) = drift_history.lock() {
-                        let _ = history.write_svg(None);
-                    }
-                    if let Ok(report) = lane_drift.lock() {
-                        let _ = report.write_html(None);
                     }
                 }
             }
@@ -127,12 +102,6 @@ pub fn run_threaded_pipeline() {
             stats.report();
             if let Ok(lb) = leaderboard.lock() {
                 let _ = lb.write_html(None);
-            }
-            if let Ok(history) = drift_history.lock() {
-                let _ = history.write_svg(None);
-            }
-            if let Ok(report) = lane_drift.lock() {
-                let _ = report.write_html(None);
             }
         })
     };
@@ -153,7 +122,7 @@ pub fn run_threaded_pipeline() {
                 }
             };
 
-            log_line("?? Connecting to Wikipedia SSE stream...");
+            log_line("Connecting to Wikipedia SSE stream...");
             let response = match client
                 .get(url)
                 .header("User-Agent", "WendyRTSProject/1.0")
@@ -174,14 +143,14 @@ pub fn run_threaded_pipeline() {
             loop {
                 // Active watchdog: check if 10 seconds have passed since last data
                 if last_data_received.elapsed() >= watchdog_timeout {
-                    log_line("?? Network Reset: no data for 10 seconds, triggering reconnect.");
+                    log_line("Network Reset: no data for 10 seconds, reconnecting.");
                     break;
                 }
 
                 buffer.clear();
                 match reader.by_ref().take(4096).read_to_end(&mut buffer) {
                     Ok(0) => {
-                        log_line("?? Network Reset: stream ended, reconnecting.");
+                        log_line("Network Reset: stream ended, reconnecting.");
                         break;
                     }
                     Ok(_) => {
@@ -197,7 +166,7 @@ pub fn run_threaded_pipeline() {
                                         crate::parser::PacketLane::Human => "HUMAN",
                                     };
                                     let summary = change_summary(&change);
-                                    log_line(format!("?? INCOMING {} {}", lane, summary));
+                                    log_line(format!("INCOMING {} {}", lane, summary));
                                     if degraded_mode_for_drop.load(Ordering::Relaxed)
                                         && is_bot(&change)
                                     {
@@ -244,9 +213,9 @@ pub fn run_threaded_pipeline() {
                     Err(e) => {
                         log_error(format!("Failed to read from stream: {:?}", e));
                         if last_data_received.elapsed() >= watchdog_timeout {
-                            log_line("?? Network Reset: no data for 10 seconds, reconnecting.");
+                            log_line("Network Reset: no data for 10 seconds, reconnecting.");
                         } else {
-                            log_line("?? Network Reset: reconnecting after read error.");
+                            log_line("Network Reset: reconnecting after read error.");
                         }
                         break;
                     }
@@ -353,10 +322,6 @@ fn process_change_thread(
         } else {
             "HUMAN"
         };
-        let lane = match packet_lane(&change) {
-            crate::parser::PacketLane::Bot => EditLane::Bot,
-            crate::parser::PacketLane::Human => EditLane::Human,
-        };
         let context = change_context(&change);
         let actual_processing_time = deadline_start.elapsed();
         let scheduling_drift_ns =
@@ -377,7 +342,6 @@ fn process_change_thread(
             ));
         }
         return ProcessSample {
-            lane,
             scheduling_drift_ns,
             processing_time: actual_processing_time,
         };
@@ -388,7 +352,6 @@ fn process_change_thread(
         actual_processing_time.as_nanos() as i128 - DEADLINE.as_nanos() as i128;
 
     ProcessSample {
-        lane: EditLane::Human,
         scheduling_drift_ns,
         processing_time: actual_processing_time,
     }
@@ -441,23 +404,14 @@ fn is_bot_packet(packet: &QueuedChange) -> bool {
 fn log_dequeue_event(packet: &QueuedChange) {
     if let Ok(change) = parse_wiki_change(&packet.payload) {
         let label = if is_bot(&change) { "BOT" } else { "HUMAN" };
-        log_line(format!("📤 DEQUEUE {} {}", label, change_summary(&change)));
+                log_line(format!("DEQUEUE {} {}", label, change_summary(&change)));
     }
 }
 
 fn log_overflow_event(lane: &str, dropped_summary: &str, incoming_summary: &str) {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    log_line(format!(
-        "[{}.{:09}] OVERFLOW DROP {} dropped=[{}] incoming=[{}]",
-        ts.as_secs(),
-        ts.subsec_nanos(),
-        lane,
-        dropped_summary,
-        incoming_summary
-    ));
+        log_line(format!("OVERFLOW DROP {} dropped=[{}] incoming=[{}]", lane, dropped_summary, incoming_summary));
 }
+
 
 
 
